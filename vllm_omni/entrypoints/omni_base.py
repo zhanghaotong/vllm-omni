@@ -85,6 +85,8 @@ class OmniBase:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
         model = omni_snapshot_download(model)
         self.model = model
+        self.model_name = model
+        self.enable_metrics = bool(kwargs.get("enable_metrics", False))
         self.log_stats = log_stats
         self.async_chunk = async_chunk
         self.output_modalities = output_modalities or []
@@ -256,16 +258,16 @@ class OmniBase:
             metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
+        stage_meta = self.engine.get_stage_metadata(stage_id)
         _m = result.get("metrics")
         if finished and _m is not None:
-            metrics.on_stage_metrics(stage_id, req_id, _m)
-
-        stage_meta = self.engine.get_stage_metadata(stage_id)
+            metrics.on_stage_metrics(stage_id, req_id, _m, stage_meta["final_output_type"])
         if not stage_meta["final_output"]:
             return None
 
         try:
             rid_key = str(req_id)
+            metrics.set_request_output_type(req_id, stage_meta["final_output_type"])
             if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done and finished:
                 metrics.on_finalize_request(
                     stage_id,
