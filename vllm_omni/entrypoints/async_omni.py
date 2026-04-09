@@ -8,6 +8,7 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -257,6 +258,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 req_id=request_id,
                 req_start_ts=submit_ts,
                 final_output_type=infer_request_output_type(output_modalities),
+                trace_headers=trace_headers,
             )
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
@@ -754,7 +756,9 @@ class AsyncOmni(EngineClient, OmniBase):
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
-        return False
+        observability_config = getattr(self.vllm_config, "observability_config", None)
+        otlp_endpoint = getattr(observability_config, "otlp_traces_endpoint", None)
+        return bool(otlp_endpoint or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
 
     async def do_log_stats(self) -> None:
         """Log statistics.

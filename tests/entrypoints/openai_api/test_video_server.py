@@ -49,19 +49,25 @@ class FakeAsyncOmni:
         self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
         self.captured_prompt = None
         self.captured_sampling_params_list = None
+        self.captured_trace_headers = None
 
-    async def generate(self, prompt, request_id, sampling_params_list):
+    async def generate(self, prompt, request_id, sampling_params_list, trace_headers=None):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
+        self.captured_trace_headers = trace_headers
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
+
+    async def is_tracing_enabled(self) -> bool:
+        return True
 
 
 class BlockingVideoHandler:
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.stage_configs = None
+        self.engine_client = SimpleNamespace()
         self.started = threading.Event()
         self.cancelled = threading.Event()
 
@@ -69,7 +75,7 @@ class BlockingVideoHandler:
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
-    async def generate_video_bytes(self, request, reference_id, *, reference_image=None):
+    async def generate_video_bytes(self, request, reference_id, *, reference_image=None, trace_headers=None):
         self.started.set()
         try:
             await asyncio.Future()
@@ -179,7 +185,7 @@ def test_async_video_generation_with_audio_bypasses_base64(test_client, mocker: 
 
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, trace_headers=None):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult([object()], audios=[object()], sample_rate=48000)
@@ -237,6 +243,31 @@ def test_t2v_video_generation_form(test_client, mocker: MockerFixture):
     assert captured.fps == 12
     assert captured.frame_rate == 12.0
     assert fps_values == [12]
+
+
+def test_video_generation_forwards_trace_headers(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "A traced video request."},
+        headers={
+            "traceparent": "00-01234567890123456789012345678901-0123456789012345-01",
+            "tracestate": "vendor=value",
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    assert engine.captured_trace_headers == {
+        "traceparent": "00-01234567890123456789012345678901-0123456789012345-01",
+        "tracestate": "vendor=value",
+    }
 
 
 def test_i2v_video_generation_form(test_client, mocker: MockerFixture):
@@ -417,9 +448,10 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         ),
     )
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, trace_headers=None):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
+        engine.captured_trace_headers = trace_headers
         import numpy as np
 
         yield MockVideoResult([np.zeros((1, 64, 64, 3), dtype=np.uint8)], audios=[object()])
@@ -444,7 +476,7 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
 def test_video_job_persists_profiler_metadata(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, trace_headers=None):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
@@ -896,7 +928,7 @@ def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
 def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, trace_headers=None):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(

@@ -8,6 +8,7 @@ import re
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItem,
     SpeechBatchItemResult,
 )
+from vllm_omni.entrypoints.openai.trace_headers import get_trace_headers
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
     estimate_fish_voice_clone_prompt_len_from_normalized,
@@ -1394,6 +1396,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _prepare_speech_generation(
         self,
         request: OpenAICreateSpeechRequest,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
@@ -1532,6 +1535,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_id=request_id,
             sampling_params_list=sampling_params_list,
             output_modalities=["audio"],
+            trace_headers=trace_headers,
         )
         return request_id, generator, tts_params
 
@@ -1544,9 +1548,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         async for chunk in self._generate_audio_chunks(generator, request_id, response_format="pcm"):
             yield chunk
 
-    async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
+    async def _iter_pcm_audio_bytes(
+        self,
+        request: OpenAICreateSpeechRequest,
+        trace_headers: Mapping[str, str] | None = None,
+    ):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
-        request_id, generator, _ = await self._prepare_speech_generation(request)
+        request_id, generator, _ = await self._prepare_speech_generation(request, trace_headers=trace_headers)
         async for chunk in self._generate_pcm_chunks(generator, request_id):
             yield chunk
 
@@ -1554,8 +1562,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
         base64_encode: bool = False,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> tuple[bytes | str, str]:
-        request_id, generator, _ = await self._prepare_speech_generation(request)
+        request_id, generator, _ = await self._prepare_speech_generation(request, trace_headers=trace_headers)
 
         final_output: OmniRequestOutput | None = None
         async for res in generator:
@@ -1725,6 +1734,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return error_check_ret
 
         try:
+            trace_headers = (
+                None if raw_request is None else await get_trace_headers(self.engine_client, raw_request.headers)
+            )
             if request.stream:
                 # Determine response format and media type for streaming
                 response_format = (request.response_format or "wav").lower()
@@ -1744,13 +1756,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
-                request_id, generator, _ = await self._prepare_speech_generation(request)
+                request_id, generator, _ = await self._prepare_speech_generation(
+                    request,
+                    trace_headers=trace_headers,
+                )
                 return StreamingResponse(
                     self._generate_audio_chunks(generator, request_id, response_format),
                     media_type=media_type,
                 )
 
-            audio_bytes, media_type = await self._generate_audio_bytes(request)
+            audio_bytes, media_type = await self._generate_audio_bytes(
+                request,
+                trace_headers=trace_headers,
+            )
             return Response(content=audio_bytes, media_type=media_type)
 
         except asyncio.CancelledError:

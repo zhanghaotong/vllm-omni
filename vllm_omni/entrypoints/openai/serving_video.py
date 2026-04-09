@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, cast
@@ -63,6 +64,10 @@ class OmniOpenAIServingVideo:
         return self._model_name
 
     @property
+    def engine_client(self) -> EngineClient:
+        return self._engine_client
+
+    @property
     def stage_configs(self) -> list[Any] | None:
         return self._stage_configs
 
@@ -89,6 +94,7 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
@@ -156,7 +162,7 @@ class OmniOpenAIServingVideo:
             gen_params.seed,
         )
 
-        result = await self._run_generation(prompt, gen_params, reference_id)
+        result = await self._run_generation(prompt, gen_params, reference_id, trace_headers=trace_headers)
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
@@ -176,8 +182,14 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> VideoGenerationResponse:
-        artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+        artifacts = await self._run_and_extract(
+            request,
+            reference_id,
+            reference_image=reference_image,
+            trace_headers=trace_headers,
+        )
 
         video_codec_options = {"preset": "ultrafast", "threads": "0"}
         if request.extra_params is not None and isinstance(request.extra_params, dict):
@@ -216,9 +228,15 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> tuple[bytes, dict[str, float], float]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
-        artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+        artifacts = await self._run_and_extract(
+            request,
+            reference_id,
+            reference_image=reference_image,
+            trace_headers=trace_headers,
+        )
         if len(artifacts.videos) > 1:
             logger.warning(
                 "Video request %s generated %d outputs; returning only the first.",
@@ -265,6 +283,8 @@ class OmniOpenAIServingVideo:
         prompt: OmniTextPrompt,
         gen_params: OmniDiffusionSamplingParams,
         request_id: str,
+        *,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> Any:
         stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
 
@@ -292,6 +312,7 @@ class OmniOpenAIServingVideo:
             prompt=prompt,
             request_id=request_id,
             sampling_params_list=sampling_params_list,
+            trace_headers=trace_headers,
         ):
             result = output
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from vllm.logger import init_logger
 
+import vllm_omni.metrics.tracing as tracing
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics, normalize_output_type
 from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
 
@@ -154,6 +155,7 @@ class OrchestratorAggregator:
         )  # {request_id: {diffusion_metrics_key: accumulated_metrics_data}}
         self.request_start_ts: dict[str, float] = {}
         self.request_output_types: dict[str, str] = {}
+        self.request_trace_headers: dict[str, Mapping[str, str] | None] = {}
         self.request_finalized: set[str] = set()
 
     def _prometheus_enabled(self) -> bool:
@@ -175,12 +177,14 @@ class OrchestratorAggregator:
         req_id: Any,
         req_start_ts: float,
         final_output_type: str | None = None,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> bool:
         rid_key = str(req_id)
         if rid_key in self.request_start_ts:
             return False
         self.request_start_ts[rid_key] = float(req_start_ts)
         self.request_output_types[rid_key] = self._resolve_output_type(rid_key, final_output_type)
+        self.request_trace_headers[rid_key] = dict(trace_headers) if trace_headers is not None else None
         if self._prometheus_enabled():
             self.prometheus_metrics.on_request_started(
                 model_name=self.model_name,
@@ -198,12 +202,44 @@ class OrchestratorAggregator:
             return False
         self.request_finalized.add(rid_key)
         self.request_output_types[rid_key] = self._resolve_output_type(rid_key, final_output_type)
+        end_time_s = time.time()
+        start_time_s = float(self.request_start_ts.get(rid_key, end_time_s))
+        total_tokens, transfers_total_time_ms, transfers_total_bytes = self._get_request_aggregates(rid_key)
+        tracing.emit_request_trace(
+            request_id=rid_key,
+            model_name=self.model_name or "unknown",
+            final_output_type=self.request_output_types[rid_key],
+            trace_headers=self.request_trace_headers.get(rid_key),
+            start_time_s=start_time_s,
+            end_time_s=end_time_s,
+            status="aborted",
+            e2e_total_ms=max(0.0, (end_time_s - start_time_s) * 1000.0),
+            e2e_total_tokens=total_tokens,
+            transfers_total_time_ms=transfers_total_time_ms,
+            transfers_total_bytes=transfers_total_bytes,
+        )
         if self._prometheus_enabled():
             self.prometheus_metrics.on_request_aborted(
                 model_name=self.model_name,
                 final_output_type=self.request_output_types[rid_key],
             )
         return True
+
+    def _get_request_aggregates(self, rid_key: str) -> tuple[int, float, int]:
+        total_tokens = 0
+        if rid_key in self.stage_events:
+            for evt in self.stage_events[rid_key]:
+                if evt.stage_id == 0:
+                    total_tokens += int(evt.num_tokens_in)
+                total_tokens += int(evt.num_tokens_out)
+
+        transfers_total_time_ms = float(
+            sum(evt.total_time_ms for evt in self.transfer_events.values() if evt.request_id == rid_key)
+        )
+        transfers_total_bytes = int(
+            sum(evt.size_bytes for evt in self.transfer_events.values() if evt.request_id == rid_key)
+        )
+        return total_tokens, transfers_total_time_ms, transfers_total_bytes
 
     def _get_or_create_transfer_event(
         self,
@@ -516,14 +552,7 @@ class OrchestratorAggregator:
         self.last_finish_ts = max(self.last_finish_ts, _t1)
         e2e_ms = (_t1 - _t0) * 1000.0
 
-        # Sum tokens from all stages for this request
-        # Include input tokens from stage 0 + output tokens from all stages
-        total_tokens = 0
-        if rid_key in self.stage_events:
-            for evt in self.stage_events[rid_key]:
-                if evt.stage_id == 0:
-                    total_tokens += int(evt.num_tokens_in)
-                total_tokens += int(evt.num_tokens_out)
+        total_tokens, transfers_total_time_ms, transfers_total_bytes = self._get_request_aggregates(rid_key)
 
         self.e2e_total_ms += e2e_ms
         self.e2e_total_tokens += total_tokens
@@ -533,15 +562,24 @@ class OrchestratorAggregator:
             request_id=rid_key,
             e2e_total_ms=e2e_ms,
             e2e_total_tokens=total_tokens,
-            transfers_total_time_ms=float(
-                sum(evt.total_time_ms for evt in self.transfer_events.values() if evt.request_id == rid_key)
-            ),
-            transfers_total_bytes=int(
-                sum(evt.size_bytes for evt in self.transfer_events.values() if evt.request_id == rid_key)
-            ),
+            transfers_total_time_ms=transfers_total_time_ms,
+            transfers_total_bytes=transfers_total_bytes,
         )
         self.e2e_events.append(per_req_record)
         self.request_output_types[rid_key] = self._resolve_output_type(rid_key)
+        tracing.emit_request_trace(
+            request_id=rid_key,
+            model_name=self.model_name or "unknown",
+            final_output_type=self.request_output_types[rid_key],
+            trace_headers=self.request_trace_headers.get(rid_key),
+            start_time_s=_t0,
+            end_time_s=_t1,
+            status="succeeded",
+            e2e_total_ms=e2e_ms,
+            e2e_total_tokens=total_tokens,
+            transfers_total_time_ms=transfers_total_time_ms,
+            transfers_total_bytes=transfers_total_bytes,
+        )
         if self._prometheus_enabled():
             self.prometheus_metrics.on_request_succeeded(
                 model_name=self.model_name,

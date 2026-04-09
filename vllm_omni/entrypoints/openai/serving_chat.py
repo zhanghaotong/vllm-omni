@@ -85,6 +85,7 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.trace_headers import get_trace_headers
 from vllm_omni.entrypoints.openai.utils import (
     get_supported_speakers_from_hf_config,
     parse_lora_request,
@@ -287,6 +288,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
+        trace_headers = (
+            None if raw_request is None else await get_trace_headers(self.engine_client, raw_request.headers)
+        )
 
         output_modalities = getattr(request, "modalities", self.engine_client.output_modalities)
         request.modalities = (
@@ -418,6 +422,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
                     output_modalities=output_modalities,
+                    trace_headers=trace_headers,
                 )
 
                 generators.append(generator)

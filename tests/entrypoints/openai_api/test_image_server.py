@@ -123,13 +123,18 @@ class FakeAsyncOmni:
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
+        self.captured_trace_headers = None
         self._images = images or [Image.new("RGB", (64, 64), color="green")]
 
-    async def generate(self, prompt, request_id, sampling_params_list):
+    async def generate(self, prompt, request_id, sampling_params_list, trace_headers=None):
         self.captured_sampling_params_list = sampling_params_list
         self.captured_prompt = prompt
+        self.captured_trace_headers = trace_headers
         images = [img.copy() for img in self._images]
         yield MockGenerationResult(images)
+
+    async def is_tracing_enabled(self) -> bool:
+        return True
 
 
 @pytest.fixture
@@ -351,6 +356,27 @@ def test_generate_images_async_omni_sampling_params(async_omni_test_client):
     assert captured[1].height == 256
     assert captured[1].width == 256
     assert captured[1].seed == 7
+
+
+def test_generate_images_async_omni_forwards_trace_headers(async_omni_test_client):
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 1,
+            "size": "256x256",
+        },
+        headers={
+            "traceparent": "00-01234567890123456789012345678901-0123456789012345-01",
+            "tracestate": "vendor=value",
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    assert engine.captured_trace_headers == {
+        "traceparent": "00-01234567890123456789012345678901-0123456789012345-01",
+        "tracestate": "vendor=value",
+    }
 
 
 def test_generate_images_async_omni_stage_configs_only(async_omni_stage_configs_only_client):

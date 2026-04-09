@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+import vllm_omni.metrics.stats as stats_module
+import vllm_omni.metrics.tracing as tracing_module
 from vllm_omni.metrics import OrchestratorAggregator
 from vllm_omni.metrics.stats import RequestE2EStats, StageRequestStats, StageStats
 
@@ -155,3 +157,102 @@ def test_build_and_log_summary_multiple_requests() -> None:
     r2_stage_entry = next(e for e in summary["stage_table"] if e["request_id"] == "r2")
     assert len(r1_stage_entry["stages"]) == 2
     assert len(r2_stage_entry["stages"]) == 1
+
+
+def test_request_tracing_emits_success_span(monkeypatch: pytest.MonkeyPatch) -> None:
+    emitted: list[dict] = []
+    monkeypatch.setattr(
+        tracing_module,
+        "emit_request_trace",
+        lambda **kwargs: emitted.append(kwargs),
+        raising=False,
+    )
+
+    agg = OrchestratorAggregator(
+        num_stages=1,
+        log_stats=False,
+        wall_start_ts=10.0,
+        final_stage_id_for_e2e=0,
+        model_name="test-model",
+    )
+    agg.on_request_started(
+        "r-success",
+        req_start_ts=10.0,
+        final_output_type="text",
+        trace_headers={},
+    )
+    agg.on_stage_metrics(
+        0,
+        "r-success",
+        StageRequestStats(
+            batch_id=1,
+            batch_size=1,
+            num_tokens_in=3,
+            num_tokens_out=4,
+            stage_gen_time_ms=25.0,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(),
+        ),
+        "text",
+    )
+
+    assert agg.on_finalize_request(0, "r-success", req_start_ts=10.0, finished_at=12.5) is True
+    assert emitted == [
+        {
+            "request_id": "r-success",
+            "model_name": "test-model",
+            "final_output_type": "text",
+            "trace_headers": {},
+            "start_time_s": 10.0,
+            "end_time_s": 12.5,
+            "status": "succeeded",
+            "e2e_total_ms": 2500.0,
+            "e2e_total_tokens": 7,
+            "transfers_total_time_ms": 0.0,
+            "transfers_total_bytes": 0,
+        }
+    ]
+
+
+def test_request_tracing_emits_aborted_span(monkeypatch: pytest.MonkeyPatch) -> None:
+    emitted: list[dict] = []
+    monkeypatch.setattr(
+        tracing_module,
+        "emit_request_trace",
+        lambda **kwargs: emitted.append(kwargs),
+        raising=False,
+    )
+    monkeypatch.setattr(stats_module.time, "time", lambda: 13.0)
+
+    agg = OrchestratorAggregator(
+        num_stages=1,
+        log_stats=False,
+        wall_start_ts=10.0,
+        final_stage_id_for_e2e=0,
+        model_name="test-model",
+    )
+    agg.on_request_started(
+        "r-abort",
+        req_start_ts=10.0,
+        final_output_type="audio",
+        trace_headers={},
+    )
+
+    assert agg.on_request_aborted("r-abort", final_output_type="audio") is True
+    assert emitted == [
+        {
+            "request_id": "r-abort",
+            "model_name": "test-model",
+            "final_output_type": "audio",
+            "trace_headers": {},
+            "start_time_s": 10.0,
+            "end_time_s": 13.0,
+            "status": "aborted",
+            "e2e_total_ms": 3000.0,
+            "e2e_total_tokens": 0,
+            "transfers_total_time_ms": 0.0,
+            "transfers_total_bytes": 0,
+        }
+    ]
