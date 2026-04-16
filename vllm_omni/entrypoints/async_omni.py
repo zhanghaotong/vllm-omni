@@ -23,6 +23,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
+from vllm.tracing import init_tracer
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -101,6 +102,12 @@ class AsyncOmni(EngineClient, OmniBase):
 
                 renderer = renderer_from_config(vllm_config)
             self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
+
+        obs_config = getattr(self.vllm_config, "observability_config", None)
+        tracing_endpoint = getattr(obs_config, "otlp_traces_endpoint", None)
+
+        if tracing_endpoint is not None:
+            init_tracer("vllm.omni_llm_engine", tracing_endpoint)
 
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
